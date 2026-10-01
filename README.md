@@ -220,14 +220,37 @@ Suggested alerts:
 ## Development
 
 ```bash
-make test     # gofmt + go vet + go test -race + version check + render deploy/values.yaml through charts-deployment 2.3.0
+make test     # gofmt + go vet + unit AND integration tests (-race) + version check + render deploy/values.yaml through charts-deployment 2.3.0
+make unit     # fast loop: unit tests only (integration tests skip themselves)
 make build    # ./bin/shepherd
 make image    # local docker build
 ./bin/shepherd --kubeconfig ~/.kube/config --leader-elect=false --dry-run=true   # preview against a cluster
 ```
 
 The decision logic is a pure function in `internal/policy` (table-tested);
-`internal/reaper` is the event/timer loop and the cross-pod safety rails.
+`internal/reaper` is the event/timer loop and the cross-pod safety rails;
+`internal/shepherd` wires informers, live triggers and leader election together.
+
+### Integration tests
+
+`make test` also runs tests against a **real kube-apiserver and etcd**
+(controller-runtime's envtest; the binaries are downloaded on first use). There
+is no kubelet in that environment, which is exactly the failure shepherd exists
+for: a bound pod that is deleted gracefully stays `Terminating` forever. They
+cover, end to end through the real informers and API:
+
+- a pod stuck on a dead node is force-deleted; on a healthy node it is only
+  reported; a pod with a finalizer is never deleted
+- **live triggers**: with the safety-net interval set to an hour, a node
+  turning NotReady or a pod entering Terminating still gets handled within
+  seconds, so only the watch events can have driven it
+- the UID precondition really protects a replacement pod that reused the name
+- leader election: exactly one replica acts, and a standby takes over
+- the **exact RBAC shipped in `deploy/values.yaml`** is sufficient to run the
+  whole flow, and is not broader than needed (can't delete nodes, read secrets)
+
+Without the binaries (`go test ./...` directly) these tests skip rather than
+fail.
 
 ## Releasing
 

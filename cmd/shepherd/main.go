@@ -17,21 +17,13 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/leaderelection"
-	"k8s.io/client-go/tools/leaderelection/resourcelock"
-	"k8s.io/client-go/tools/record"
 
 	"github.com/magicorntech/shepherd/internal/policy"
 	"github.com/magicorntech/shepherd/internal/reaper"
+	"github.com/magicorntech/shepherd/internal/shepherd"
 )
 
 var version = "dev"
@@ -90,67 +82,6 @@ func main() {
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	metrics := reaper.NewMetrics(reg)
-
-	// Pod informers only need to see pods being deleted, but the API can't
-	// field-select on deletionTimestamp, so cache them all (metadata is
-	// small) and filter in the sweep.
-	factory := informers.NewSharedInformerFactoryWithOptions(client, 0, informers.WithNamespace(*namespace))
-	podInformer := factory.Core().V1().Pods()
-	podLister := podInformer.Lister()
-	podSynced := podInformer.Informer().HasSynced
-	// Nodes are cluster-scoped, so they need their own unscoped factory.
-	nodeFactory := informers.NewSharedInformerFactory(client, 0)
-	nodeInformer := nodeFactory.Core().V1().Nodes()
-	nodeLister := nodeInformer.Lister()
-	nodeSynced := nodeInformer.Informer().HasSynced
-
-	broadcaster := record.NewBroadcaster()
-	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events("")})
-	defer broadcaster.Shutdown()
-	recorder := broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "shepherd"})
-
-	r := reaper.New(reaper.Config{
-		Policy: policy.Config{
-			DefaultMode:        mode,
-			DeadNodeBuffer:     *deadBuffer,
-			HealthyNodeBuffer:  *healthyBuf,
-			IncludeStatefulSet: *inclSTS,
-			IncludePVC:         *inclPVC,
-		},
-		Interval:           *interval,
-		DryRun:             *dryRun,
-		MaxDeletesPerSweep: *maxPerSweep,
-		BreakerFraction:    *breakerFrac,
-		BreakerMinNodes:    *breakerNodes,
-	}, client, podLister, nodeLister, recorder, log, metrics)
-
-	// Live triggers. A pod entering Terminating, or a node flipping its Ready
-	// state / disappearing, can change a decision immediately; the reaper
-	// also sleeps exactly until the next pod's deadline, so nothing waits on
-	// a poll tick.
-	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(o any) {
-			if p, ok := o.(*corev1.Pod); ok && p.DeletionTimestamp != nil {
-				r.Kick()
-			}
-		},
-		UpdateFunc: func(_, o any) {
-			if p, ok := o.(*corev1.Pod); ok && p.DeletionTimestamp != nil {
-				r.Kick()
-			}
-		},
-	})
-	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(o, n any) {
-			on, ok1 := o.(*corev1.Node)
-			nn, ok2 := n.(*corev1.Node)
-			if ok1 && ok2 && nodeReady(on) != nodeReady(nn) {
-				r.Kick()
-			}
-		},
-		DeleteFunc: func(any) { r.Kick() },
-	})
 
 	ready := make(chan struct{})
 	mux := http.NewServeMux()
@@ -172,57 +103,39 @@ func main() {
 	}()
 	defer srv.Shutdown(context.Background()) //nolint:errcheck
 
-	// Informers run on every replica (so a standby is warm); only the
-	// leader sweeps.
-	factory.Start(ctx.Done())
-	nodeFactory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), podSynced, nodeSynced) {
-		fatal(log, "cache sync", fmt.Errorf("cancelled before caches synced"))
-	}
-	close(ready)
-
-	log.Info("shepherd started", "version", version, "dryRun", *dryRun, "defaultMode", mode,
-		"namespace", *namespace, "leaderElect", *leaderElect)
-	if *dryRun {
-		log.Warn("DRY RUN: nothing will be deleted. Drop --dry-run to act.")
-	}
-
-	if !*leaderElect {
-		r.Run(ctx)
-		return
-	}
-
 	ns := *leaseNS
 	if ns == "" {
 		ns = podNamespace()
 	}
 	id, _ := os.Hostname()
-	lock := &resourcelock.LeaseLock{
-		LeaseMeta:  metav1.ObjectMeta{Name: *leaseName, Namespace: ns},
-		Client:     client.CoordinationV1(),
-		LockConfig: resourcelock.ResourceLockConfig{Identity: id},
-	}
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-		Lock:            lock,
-		ReleaseOnCancel: true,
-		LeaseDuration:   30 * time.Second,
-		RenewDeadline:   20 * time.Second,
-		RetryPeriod:     5 * time.Second,
-		Name:            *leaseName,
-		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) { log.Info("became leader", "id", id); r.Run(ctx) },
-			OnStoppedLeading: func() { log.Info("stopped leading", "id", id) },
-		},
-	})
-}
 
-func nodeReady(n *corev1.Node) bool {
-	for _, c := range n.Status.Conditions {
-		if c.Type == corev1.NodeReady {
-			return c.Status == corev1.ConditionTrue
-		}
+	err = shepherd.Run(ctx, client, shepherd.Options{
+		Version:   version,
+		Namespace: *namespace,
+		Reaper: reaper.Config{
+			Policy: policy.Config{
+				DefaultMode:        mode,
+				DeadNodeBuffer:     *deadBuffer,
+				HealthyNodeBuffer:  *healthyBuf,
+				IncludeStatefulSet: *inclSTS,
+				IncludePVC:         *inclPVC,
+			},
+			Interval:           *interval,
+			DryRun:             *dryRun,
+			MaxDeletesPerSweep: *maxPerSweep,
+			BreakerFraction:    *breakerFrac,
+			BreakerMinNodes:    *breakerNodes,
+		},
+		Metrics:        reaper.NewMetrics(reg),
+		LeaderElect:    *leaderElect,
+		LeaseName:      *leaseName,
+		LeaseNamespace: ns,
+		Identity:       id,
+		OnSynced:       func() { close(ready) },
+	}, log)
+	if err != nil {
+		fatal(log, "run", err)
 	}
-	return false
 }
 
 func restConfig(kubeconfig string) (*rest.Config, error) {

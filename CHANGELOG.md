@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- Integration tests against a real kube-apiserver (envtest); no behaviour change.
+- Internal: startup wiring moved from `cmd/shepherd` into `internal/shepherd`
+  so it can be run by tests.
+
 ## [0.1.1]
 
 Logging fixes.
