@@ -584,3 +584,23 @@ func TestDryRunAppliesToEveryJob(t *testing.T) {
 		t.Fatal("--dry-run deleted something")
 	}
 }
+
+// Every other test restricts shepherd to one namespace to stay isolated; this
+// one runs it the way it ships (no --namespace) and checks both jobs act in
+// more than one namespace.
+func TestWithoutANamespaceFlagItWatchesEveryNamespace(t *testing.T) {
+	c := testenv.Client(t)
+	dead := newNode(t, c, false)
+	nsA, nsB := newNamespace(t, c), newNamespace(t, c)
+	start(t, testenv.Config(t), "") // "" == all namespaces, the default
+
+	var pods []*corev1.Pod
+	for _, ns := range []string{nsA, nsB} {
+		stuck := podOn(t, c, ns, dead)
+		terminate(t, c, stuck)
+		pods = append(pods, stuck, evictedPod(t, c, ns, dead, time.Hour))
+	}
+	for _, p := range pods {
+		waitGone(t, c, p, 20*time.Second)
+	}
+}
