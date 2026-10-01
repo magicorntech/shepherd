@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -49,11 +50,28 @@ type Reaper struct {
 	now      func() time.Time
 	m        *Metrics
 	kick     chan struct{}
+
+	// alerted remembers what we already told humans about each stuck pod, so
+	// a pod that stays stuck is reported once (and again after alertRepeat
+	// as a reminder), not on every sweep. Only touched from Sweep, which
+	// never runs concurrently with itself.
+	alerted        map[types.UID]alertState
+	breakerWasOpen bool
 }
+
+type alertState struct {
+	reason string
+	at     time.Time
+}
+
+// alertRepeat is how long a still-stuck pod stays quiet before being
+// reported again.
+const alertRepeat = time.Hour
 
 func New(cfg Config, client kubernetes.Interface, pods listersv1.PodLister, nodes listersv1.NodeLister,
 	recorder record.EventRecorder, log *slog.Logger, m *Metrics) *Reaper {
-	return &Reaper{cfg: cfg, client: client, pods: pods, nodes: nodes, recorder: recorder, log: log, now: time.Now, m: m, kick: make(chan struct{}, 1)}
+	return &Reaper{cfg: cfg, client: client, pods: pods, nodes: nodes, recorder: recorder, log: log, now: time.Now, m: m, kick: make(chan struct{}, 1),
+		alerted: map[types.UID]alertState{}}
 }
 
 // minSweepGap bounds how often event bursts (35 pods of one Deployment all
@@ -125,10 +143,16 @@ func (r *Reaper) Sweep(ctx context.Context) time.Duration {
 
 	breaker := r.breakerOpen(len(nodeList), notReady)
 	r.m.breakerOpen.Set(boolToFloat(breaker))
-	if breaker {
+	// Log transitions only: a breaker that stays open for an hour must not
+	// print a line per sweep.
+	if breaker && !r.breakerWasOpen {
 		r.log.Warn("circuit breaker open: too many NotReady nodes, not force-deleting pods on dead nodes",
 			"notReady", notReady, "nodes", len(nodeList))
+	} else if !breaker && r.breakerWasOpen {
+		r.log.Info("circuit breaker closed: NotReady nodes back below threshold",
+			"notReady", notReady, "nodes", len(nodeList))
 	}
+	r.breakerWasOpen = breaker
 
 	// Oldest-stuck first so the per-sweep cap can't starve a long-stuck pod.
 	var terminating []*corev1.Pod
@@ -142,6 +166,7 @@ func (r *Reaper) Sweep(ctx context.Context) time.Duration {
 	})
 
 	r.m.stuck.Reset()
+	stillAlerting := map[types.UID]struct{}{}
 	deleted := 0
 	var nextWake time.Duration
 	for _, p := range terminating {
@@ -163,11 +188,22 @@ func (r *Reaper) Sweep(ctx context.Context) time.Duration {
 			if d.RequeueAfter > 0 && (nextWake == 0 || d.RequeueAfter < nextWake) {
 				nextWake = d.RequeueAfter
 			}
+			// DEBUG only: answers "why hasn't it deleted that pod yet?"
+			// without a line per waiting pod per sweep at the default level.
+			r.log.Debug("pod terminating, waiting for its deadline",
+				"pod", key(p), "node", p.Spec.NodeName, "nodeState", d.NodeState, "mode", string(d.Mode),
+				"reason", d.Reason, "remaining", d.RequeueAfter.Round(time.Second).String())
 		case policy.Alert:
 			r.m.stuck.WithLabelValues(d.Action.String(), d.Reason).Inc()
+			stillAlerting[p.UID] = struct{}{}
+			prev, seen := r.alerted[p.UID]
+			if seen && prev.reason == d.Reason && start.Sub(prev.at) < alertRepeat {
+				break // already told humans; stay quiet until it changes or the reminder is due
+			}
+			r.alerted[p.UID] = alertState{reason: d.Reason, at: start}
 			r.log.Warn("pod stuck terminating, not force-deleting",
 				"pod", key(p), "node", p.Spec.NodeName, "nodeState", d.NodeState, "reason", d.Reason,
-				"terminatingFor", start.Sub(p.DeletionTimestamp.Time).Round(time.Second))
+				"terminatingFor", start.Sub(p.DeletionTimestamp.Time).Round(time.Second).String())
 			r.recorder.Eventf(p, corev1.EventTypeWarning, "ShepherdStuckTerminating",
 				"Pod is stuck terminating (%s); shepherd will not force-delete it", d.Reason)
 		case policy.ForceDelete:
@@ -175,6 +211,13 @@ func (r *Reaper) Sweep(ctx context.Context) time.Duration {
 			if r.forceDelete(ctx, p, d) {
 				deleted++
 			}
+		}
+	}
+	// Forget pods that are gone or no longer alerting, so the map can't
+	// grow forever and a pod that gets stuck again later is reported again.
+	for uid := range r.alerted {
+		if _, ok := stillAlerting[uid]; !ok {
+			delete(r.alerted, uid)
 		}
 	}
 	r.m.sweepSeconds.Observe(time.Since(start).Seconds())

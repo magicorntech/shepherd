@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.1]
+
+Logging fixes.
+
+- Durations in log lines are human-readable strings (`"terminatingFor":"10m0s"`)
+  instead of raw nanoseconds.
+- A pod that stays stuck is reported once (log line + Kubernetes Event), not on
+  every sweep: again only if the reason changes, or as an hourly reminder. The
+  circuit breaker logs on open/close transitions instead of every sweep.
+- New `--log-level` flag (`debug|info|warn|error`, default `info`). At `debug`,
+  every pod that is still waiting for its deadline is logged with the time
+  remaining.
+
 ## [0.1.0]
 
 First release.

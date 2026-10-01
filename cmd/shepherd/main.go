@@ -55,12 +55,19 @@ func main() {
 		leaseNS      = flag.String("leader-election-namespace", "", "namespace of the Lease; empty = the pod's own namespace")
 		leaseName    = flag.String("leader-election-name", "shepherd", "name of the Lease")
 		logJSON      = flag.Bool("log-json", true, "JSON logs")
+		logLevel     = flag.String("log-level", "info", "debug, info, warn or error; debug also logs every pod that is waiting for its deadline")
 	)
 	flag.Parse()
 
-	var h slog.Handler = slog.NewTextHandler(os.Stderr, nil)
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
+		fmt.Fprintf(os.Stderr, "bad --log-level %q (want debug, info, warn or error)\n", *logLevel)
+		os.Exit(1)
+	}
+	opts := &slog.HandlerOptions{Level: level}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
 	if *logJSON {
-		h = slog.NewJSONHandler(os.Stderr, nil)
+		h = slog.NewJSONHandler(os.Stderr, opts)
 	}
 	log := slog.New(h)
 

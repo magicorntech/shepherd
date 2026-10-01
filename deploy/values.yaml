@@ -3,7 +3,7 @@
 #
 #   helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
 #     --version 2.3.0 -n shepherd --create-namespace \
-#     -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/values.yaml
+#     -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.1/deploy/values.yaml
 #
 # Acts on the whole cluster out of the box: any pod stuck Terminating on a
 # dead node (and not excluded: finalizers, StatefulSet, PVC) is force-deleted.
@@ -16,7 +16,7 @@ global:
   deployment:
     image:
       # Tag == shepherd release version (ci/check-versions.sh enforces it).
-      uri: public.ecr.aws/magicorn/shepherd:0.1.0
+      uri: public.ecr.aws/magicorn/shepherd:0.1.1
       pullPolicy: IfNotPresent
       imagePullSecrets: []
       # All flags: https://github.com/magicorntech/shepherd#flags

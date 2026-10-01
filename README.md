@@ -107,7 +107,7 @@ support).
 ```bash
 helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
   --version 2.3.0 -n shepherd --create-namespace \
-  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/values.yaml
+  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.1/deploy/values.yaml
 ```
 
 The values grant everything shepherd needs through the chart's own
@@ -122,7 +122,7 @@ It acts immediately, cluster-wide. To preview first, install with
 ```bash
 helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
   --version 2.3.0 -n shepherd --create-namespace \
-  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/values.yaml \
+  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.1/deploy/values.yaml \
   --set 'global.deployment.image.args={--dry-run=true,--default-mode=dead-node,--dead-node-buffer=30s,--healthy-node-buffer=5m}'
 
 kubectl -n shepherd logs deploy/shepherd -f | grep "would force-delete"
@@ -173,7 +173,27 @@ arm64). It needs a ServiceAccount with: `get,list,watch,delete` on `pods`,
 | `--leader-election-name` | `shepherd` | |
 | `--metrics-addr` | `:8080` | `/metrics`, `/healthz`, `/readyz` |
 | `--log-json` | `true` | |
+| `--log-level` | `info` | `debug` also logs each pod that is waiting for its deadline |
 | `--kubeconfig` | in-cluster | for running locally |
+
+## Logs
+
+Structured JSON on stderr (`--log-json=false` for plain text).
+
+| level | message | when |
+|-------|---------|------|
+| INFO | `shepherd started`, `became leader`, `stopped leading` | lifecycle |
+| INFO | `force-deleted pod` (`would force-delete pod` with `--dry-run`) | the action itself; carries `pod`, `node`, `nodeState`, `mode`, `reason` |
+| INFO | `pod already gone or replaced` | the UID precondition did its job |
+| WARN | `pod stuck terminating, not force-deleting` | needs a human; carries `reason` (`finalizers`, `statefulset`, `pvc`, `healthy-node`, `circuit-open`) and `terminatingFor`. Logged once per pod per reason, then hourly as a reminder |
+| WARN | `circuit breaker open` / INFO `circuit breaker closed` | on transitions only |
+| WARN | `per-sweep delete cap reached, deferring` | more stuck pods than `--max-deletes-per-sweep` |
+| ERROR | `force delete failed`, `list pods`, `list nodes` | unexpected API errors |
+| DEBUG | `pod terminating, waiting for its deadline` | `--log-level=debug`; shows `remaining` |
+
+`reason` on a deletion is `dead-node`, `node-missing` or `stuck-on-healthy-node`.
+The same facts are also Kubernetes Events on the pod (`ShepherdForceDeleted`,
+`ShepherdStuckTerminating`).
 
 ## Metrics
 
