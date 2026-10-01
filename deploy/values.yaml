@@ -1,15 +1,15 @@
-# Ready-made values for Magicorn's charts-deployment chart (2.2.0) that
-# deploy shepherd. Install (release name AND namespace must be `shepherd`;
-# the leader-election RBAC in extras.yaml is written for exactly that):
+# Ready-made values for Magicorn's charts-deployment chart (2.3.0+) that
+# deploy shepherd:
 #
-#   kubectl apply -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/extras.yaml
 #   helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
-#     --version 2.2.0 -n shepherd \
+#     --version 2.3.0 -n shepherd --create-namespace \
 #     -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/values.yaml
 #
-# Starts in DRY RUN: it logs what it would force-delete and deletes nothing.
-# Pods are only ever touched if their pod template carries the opt-in label
-# shepherd.magicorn.co/force-delete (dead-node | any).
+# Acts on the whole cluster out of the box: any pod stuck Terminating on a
+# dead node (and not excluded: finalizers, StatefulSet, PVC) is force-deleted.
+# To preview first, add --dry-run=true below. Per workload, the pod label
+# shepherd.magicorn.co/force-delete overrides the default: off (exempt),
+# dead-node, or any (also stuck-on-healthy-node).
 global:
   destination: datacenter # no cloud-specific objects; shepherd has no ingress
 
@@ -21,8 +21,8 @@ global:
       imagePullSecrets: []
       # All flags: https://github.com/magicorntech/shepherd#flags
       args:
-        - --dry-run=true # <- set to false to actually delete
-        - --default-mode=off # pods opt in via the shepherd.magicorn.co/force-delete label
+        - --default-mode=dead-node # off | dead-node | any, for pods without the label
+        # - --dry-run=true # log what would be deleted, delete nothing
         - --dead-node-buffer=30s
         - --healthy-node-buffer=5m
         - --max-deletes-per-sweep=50
@@ -75,10 +75,10 @@ global:
     serviceAccount:
       enabled: true
       clusterWideAccess: true
-      # Leader-election Lease permissions are deliberately NOT here: this
-      # is a ClusterRole, and cluster-wide create/update on leases would
-      # let shepherd touch kube-system's control-plane leases. They live in
-      # extras.yaml as a Role scoped to the shepherd namespace.
+      # Note: charts-deployment can only render a ClusterRole, so the Lease
+      # permission leader election needs is cluster-wide here. It does not
+      # let shepherd do anything it could not already do with pod delete
+      # rights; if that bothers you, run one replica with --leader-elect=false.
       rules:
         - apiGroups: [""]
           resources: [pods]
@@ -89,6 +89,9 @@ global:
         - apiGroups: [""]
           resources: [events]
           verbs: [create, patch]
+        - apiGroups: [coordination.k8s.io]
+          resources: [leases]
+          verbs: [get, create, update]
     podSecurityContext:
       runAsNonRoot: true
       runAsUser: 65532
@@ -98,3 +101,8 @@ global:
       allowPrivilegeEscalation: false
       readOnlyRootFilesystem: true
       capabilities: {drop: [ALL]}
+
+  # Keep at least one replica (the leader or the standby) through node drains.
+  pdb:
+    enabled: true
+    minAvailable: 1

@@ -24,8 +24,7 @@ jobs:
       - name: kubeconform
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin kubeconform
-          { helm template shepherd oci://public.ecr.aws/magicorn/charts-deployment --version 2.2.0 -n shepherd -f deploy/values.yaml
-            echo ---; cat deploy/extras.yaml; } \
+          helm template shepherd oci://public.ecr.aws/magicorn/charts-deployment --version 2.3.0 -n shepherd -f deploy/values.yaml \
             | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.30.0
 
   image:

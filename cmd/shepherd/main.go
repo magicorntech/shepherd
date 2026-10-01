@@ -41,8 +41,8 @@ func main() {
 		kubeconfig   = flag.String("kubeconfig", "", "path to kubeconfig; empty = in-cluster")
 		namespace    = flag.String("namespace", "", "only watch this namespace; empty = all")
 		interval     = flag.Duration("interval", 60*time.Second, "safety-net sweep interval; sweeps are normally triggered by watch events and per-pod deadlines")
-		dryRun       = flag.Bool("dry-run", true, "log what would be force-deleted without deleting; pass --dry-run=false to act")
-		defaultMode  = flag.String("default-mode", "off", "mode for pods without the "+policy.ModeLabel+" label: off, dead-node, any")
+		dryRun       = flag.Bool("dry-run", false, "log what would be force-deleted without deleting")
+		defaultMode  = flag.String("default-mode", "dead-node", "mode for pods without the "+policy.ModeLabel+" label: off, dead-node, any")
 		deadBuffer   = flag.Duration("dead-node-buffer", 30*time.Second, "extra wait after the pod's deletion deadline before force-deleting a pod on a dead node")
 		healthyBuf   = flag.Duration("healthy-node-buffer", 5*time.Minute, "extra wait after the pod's deletion deadline before force-deleting a pod on a Ready node (mode=any only)")
 		inclSTS      = flag.Bool("include-statefulset", false, "also force-delete StatefulSet pods (breaks at-most-one; off by default)")
@@ -177,7 +177,7 @@ func main() {
 	log.Info("shepherd started", "version", version, "dryRun", *dryRun, "defaultMode", mode,
 		"namespace", *namespace, "leaderElect", *leaderElect)
 	if *dryRun {
-		log.Warn("DRY RUN: nothing will be deleted. Pass --dry-run=false once the logs look right.")
+		log.Warn("DRY RUN: nothing will be deleted. Drop --dry-run to act.")
 	}
 
 	if !*leaderElect {

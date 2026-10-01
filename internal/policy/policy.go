@@ -18,8 +18,8 @@ const ModeLabel = "shepherd.magicorn.co/force-delete"
 type Mode string
 
 const (
-	// ModeOff: never touch this pod. The default for any pod without the
-	// label unless Config.DefaultMode says otherwise.
+	// ModeOff: never touch this pod. Use the label to exempt a workload
+	// when the cluster-wide default is dead-node or any.
 	ModeOff Mode = "off"
 	// ModeDeadNode: force-delete only when the pod's node is NotReady/Unknown
 	// or its Node object is gone. Safe because a dead node runs nothing.
@@ -28,7 +28,7 @@ const (
 	// that still reports Ready. The API object goes away immediately but
 	// the kubelet may still be tearing the container down, so for a
 	// workload with an exclusive resource (a UDP port, a lock) old and new
-	// can briefly coexist. A deliberate opt-in.
+	// can briefly coexist. Never a default; opt in per pod via the label.
 	ModeAny Mode = "any"
 )
 

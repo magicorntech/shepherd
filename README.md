@@ -8,8 +8,8 @@ are stuck `Terminating`**, so a `Recreate` rollout (or anything else waiting for
 the old pod object to disappear) isn't blocked forever.
 
 - Event-driven (watches pods and nodes), no polling lag
-- **Opt-in per workload** via a pod label; touches nothing by default
-- **Dry-run by default**
+- Works cluster-wide out of the box; a pod label overrides it per workload (exempt, or widen)
+- Optional `--dry-run` to preview before acting
 - Single static binary, distroless image, leader-elected, Prometheus metrics
 
 ## The problem
@@ -41,9 +41,10 @@ that Kubernetes itself only marks a silent node NotReady after
 `node-monitor-grace-period` (40s by default), so total time-to-recovery is
 roughly that + the pod's grace period + the buffer.
 
-### Opting a workload in
+### Per-workload override
 
-Nothing is touched unless the **pod template** carries this label:
+By default (`--default-mode=dead-node`) every pod in the cluster is covered. To
+change that for one workload, put this label on its **pod template**:
 
 ```yaml
 spec:
@@ -55,15 +56,15 @@ spec:
 
 | value       | behaviour |
 |-------------|-----------|
-| `off`       | never touch (the default) |
-| `dead-node` | force-delete only when the node is dead; on a healthy node, alert only |
+| `off`       | never touch: exempt this workload |
+| `dead-node` | force-delete only when the node is dead; on a healthy node, alert only (the cluster default) |
 | `any`       | also force-delete when stuck on a healthy node |
 
-Use `dead-node` unless you have a reason not to. `any` is a real trade-off: the
+`any` is never the default, because it is a real trade-off: the
 API object disappears at once while the kubelet may still be killing the
 container, so for something holding an exclusive resource (a UDP port, a lock)
-the old and new pod can briefly overlap. `--default-mode` changes the default
-for pods without the label.
+the old and new pod can briefly overlap. `--default-mode=off` flips shepherd to
+true opt-in (only labelled pods are touched).
 
 ### What it will not force-delete (alert only)
 
@@ -76,7 +77,7 @@ for pods without the label.
 
 ### Safety rails
 
-- **Dry-run by default.** Pass `--dry-run=false` to act.
+- **Optional dry-run.** `--dry-run=true` logs what it would delete and deletes nothing.
 - **Circuit breaker.** If more than 30% of nodes (in clusters of 5+) are
   NotReady, that is more likely a network partition or control-plane problem
   than dead nodes. Dead-node deletes are suspended and alerted instead.
@@ -99,42 +100,36 @@ replacement, i.e. a **brief duplicate**. For workloads where that is unsafe
 shepherd is deployed with Magicorn's `charts-deployment` Helm chart
 (published to the [Magicorn ECR Public Gallery](https://gallery.ecr.aws/magicorn/charts-deployment));
 this repo ships a ready-made [`deploy/values.yaml`](deploy/values.yaml) for it,
-so there is no separate shepherd chart. Requires Helm 3.10+.
-
-The release name and namespace must both be `shepherd` (the leader-election RBAC
-in `extras.yaml` is written for exactly that).
+so there is no separate shepherd chart. Requires Helm 3.10+ and
+`charts-deployment` **2.3.0 or newer** (the values use its PodDisruptionBudget
+support).
 
 ```bash
-# 1. namespace + leader-election Role + PodDisruptionBudget
-kubectl apply -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/extras.yaml
-
-# 2. shepherd itself
 helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
-  --version 2.2.0 -n shepherd \
+  --version 2.3.0 -n shepherd --create-namespace \
   -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/values.yaml
 ```
 
-`extras.yaml` exists because `charts-deployment` can only grant a ClusterRole,
-and Lease create/update cluster-wide would let shepherd touch control-plane
-leases in `kube-system`. Leases are therefore a Role scoped to the `shepherd`
-namespace.
+The values grant everything shepherd needs through the chart's own
+`security.serviceAccount.rules`: pods, nodes, events and the Lease for leader
+election. `charts-deployment` can only render a ClusterRole, so the Lease
+permission is cluster-wide; to avoid that, run a single replica with
+`--leader-elect=false`.
 
-It starts in **dry-run**. Watch what it would do:
+It acts immediately, cluster-wide. To preview first, install with
+`--dry-run=true` and watch what it would do:
 
 ```bash
+helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
+  --version 2.3.0 -n shepherd --create-namespace \
+  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/values.yaml \
+  --set 'global.deployment.image.args={--dry-run=true,--default-mode=dead-node,--dead-node-buffer=30s,--healthy-node-buffer=5m}'
+
 kubectl -n shepherd logs deploy/shepherd -f | grep "would force-delete"
 ```
 
-When the decisions look right, switch it on. Either edit a local copy of
-`values.yaml` (`--dry-run=false` in `global.deployment.image.args`), or:
-
-```bash
-helm upgrade shepherd oci://public.ecr.aws/magicorn/charts-deployment \
-  --version 2.2.0 -n shepherd --reuse-values \
-  --set 'global.deployment.image.args={--dry-run=false,--default-mode=off,--dead-node-buffer=30s,--healthy-node-buffer=5m}'
-```
-
-(`--set` replaces the whole `args` list, so repeat every flag you want.)
+(`--set` replaces the whole `args` list, so repeat every flag you want; or keep
+a local copy of `values.yaml`.) Re-run without the `--set` to go live.
 
 To scrape metrics with the Prometheus Operator, point a ServiceMonitor at the
 `shepherd` Service, port `metrics` (the chart does not render one).
@@ -147,7 +142,8 @@ as Helm hooks, so `helm uninstall` leaves them behind:
 ```bash
 helm uninstall shepherd -n shepherd
 kubectl delete clusterrole,clusterrolebinding shepherd
-kubectl delete namespace shepherd   # also removes the ServiceAccount, Role, PDB
+kubectl -n shepherd delete serviceaccount shepherd
+kubectl delete namespace shepherd   # optional
 ```
 
 ### Not using Helm?
@@ -155,14 +151,14 @@ kubectl delete namespace shepherd   # also removes the ServiceAccount, Role, PDB
 The image is `public.ecr.aws/magicorn/shepherd:<version>` (linux/amd64 and
 arm64). It needs a ServiceAccount with: `get,list,watch,delete` on `pods`,
 `get,list,watch` on `nodes`, `create,patch` on `events`, and
-`get,create,update` on `leases` in its own namespace.
+`get,create,update` on `leases` (in its own namespace if you write a Role).
 
 ## Flags
 
 | flag | default | |
 |------|---------|--|
-| `--dry-run` | `true` | log what would be deleted, delete nothing |
-| `--default-mode` | `off` | mode for pods without the label: `off`, `dead-node`, `any` |
+| `--dry-run` | `false` | log what would be deleted, delete nothing |
+| `--default-mode` | `dead-node` | mode for pods without the label: `off`, `dead-node`, `any` |
 | `--dead-node-buffer` | `30s` | extra wait after a pod's deletion deadline, node dead |
 | `--healthy-node-buffer` | `5m` | extra wait after a pod's deletion deadline, node Ready |
 | `--include-statefulset` | `false` | also force-delete StatefulSet pods |
@@ -204,10 +200,10 @@ Suggested alerts:
 ## Development
 
 ```bash
-make test     # gofmt + go vet + go test -race + version check + render deploy/values.yaml through charts-deployment 2.2.0
+make test     # gofmt + go vet + go test -race + version check + render deploy/values.yaml through charts-deployment 2.3.0
 make build    # ./bin/shepherd
 make image    # local docker build
-./bin/shepherd --kubeconfig ~/.kube/config --leader-elect=false   # dry-run against a cluster
+./bin/shepherd --kubeconfig ~/.kube/config --leader-elect=false --dry-run=true   # preview against a cluster
 ```
 
 The decision logic is a pure function in `internal/policy` (table-tested);
