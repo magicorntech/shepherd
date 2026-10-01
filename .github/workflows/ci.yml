@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.4
+      - name: make test
+        run: make test
+      - name: kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin kubeconform
+          { helm template shepherd oci://public.ecr.aws/magicorn/charts-deployment --version 2.2.0 -n shepherd -f deploy/values.yaml
+            echo ---; cat deploy/extras.yaml; } \
+            | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.30.0
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build (multi-arch, not pushed)
+        run: docker buildx build --platform linux/amd64,linux/arm64 .

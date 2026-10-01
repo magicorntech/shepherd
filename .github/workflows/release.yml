@@ -1,0 +1,64 @@
+name: Release
+
+# Push a tag X.Y.Z to publish public.ecr.aws/magicorn/shepherd:X.Y.Z
+# (linux/amd64 + linux/arm64). Runs on a GitHub-hosted runner.
+#
+# One-time setup:
+#   * ECR Public repository `shepherd` in the magicorn registry
+#   * an IAM role GitHub can assume via OIDC, allowed ecr-public:* on that
+#     repo; put its ARN in the repo variable AWS_ECR_ROLE_ARN
+on:
+  push:
+    tags: ["*.*.*"]
+
+permissions:
+  id-token: write # OIDC to AWS
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.4
+
+      - name: full test suite
+        run: make test
+
+      - name: CHANGELOG has an entry for this version
+        run: grep -qF "## [${GITHUB_REF_NAME}]" CHANGELOG.md
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_ROLE_ARN }}
+          aws-region: us-east-1 # ECR Public is only served from us-east-1
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: refuse to overwrite an already-published version
+        # ECR Public tags are mutable: pushing again would silently replace
+        # the image for everyone already pinned to this version.
+        run: |
+          if docker manifest inspect "public.ecr.aws/magicorn/shepherd:${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "FAIL: shepherd:${GITHUB_REF_NAME} is already published" >&2
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+      - name: build and push (multi-arch)
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="${GITHUB_REF_NAME}" \
+            -t "public.ecr.aws/magicorn/shepherd:${GITHUB_REF_NAME}" \
+            --push .

@@ -1,0 +1,100 @@
+# Ready-made values for Magicorn's charts-deployment chart (2.2.0) that
+# deploy shepherd. Install (release name AND namespace must be `shepherd`;
+# the leader-election RBAC in extras.yaml is written for exactly that):
+#
+#   kubectl apply -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/extras.yaml
+#   helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
+#     --version 2.2.0 -n shepherd \
+#     -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.0/deploy/values.yaml
+#
+# Starts in DRY RUN: it logs what it would force-delete and deletes nothing.
+# Pods are only ever touched if their pod template carries the opt-in label
+# shepherd.magicorn.co/force-delete (dead-node | any).
+global:
+  destination: datacenter # no cloud-specific objects; shepherd has no ingress
+
+  deployment:
+    image:
+      # Tag == shepherd release version (ci/check-versions.sh enforces it).
+      uri: public.ecr.aws/magicorn/shepherd:0.1.0
+      pullPolicy: IfNotPresent
+      imagePullSecrets: []
+      # All flags: https://github.com/magicorntech/shepherd#flags
+      args:
+        - --dry-run=true # <- set to false to actually delete
+        - --default-mode=off # pods opt in via the shepherd.magicorn.co/force-delete label
+        - --dead-node-buffer=30s
+        - --healthy-node-buffer=5m
+        - --max-deletes-per-sweep=50
+        - --breaker-not-ready-fraction=0.3
+        - --breaker-min-nodes=5
+        # - --include-statefulset
+        # - --include-pvc
+        # - --namespace=my-namespace # restrict to a single namespace
+    env: []
+    # Two replicas: one holds the Lease and sweeps, the other is a warm
+    # standby. Leader election is on by default (--leader-elect).
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+    readiness:
+      httpGet: {path: /readyz, port: metrics}
+      periodSeconds: 10
+      failureThreshold: 3
+    liveness:
+      httpGet: {path: /healthz, port: metrics}
+      periodSeconds: 20
+      failureThreshold: 3
+    deregistrationTime: 30
+    strategy:
+      type: RollingUpdate
+      rollingUpdate: {maxSurge: 1, maxUnavailable: 1}
+    # If shepherd's own node dies, the standby must take over in seconds,
+    # not after Kubernetes' default 5 minutes of toleration.
+    tolerations:
+      - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 30}
+      - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 30}
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+
+  service:
+    enabled: true
+    type: ClusterIP
+    ports:
+      metrics:
+        inner: 8080
+        outer: 8080
+
+  security:
+    serviceAccount:
+      enabled: true
+      clusterWideAccess: true
+      # Leader-election Lease permissions are deliberately NOT here: this
+      # is a ClusterRole, and cluster-wide create/update on leases would
+      # let shepherd touch kube-system's control-plane leases. They live in
+      # extras.yaml as a Role scoped to the shepherd namespace.
+      rules:
+        - apiGroups: [""]
+          resources: [pods]
+          verbs: [get, list, watch, delete]
+        - apiGroups: [""]
+          resources: [nodes]
+          verbs: [get, list, watch]
+        - apiGroups: [""]
+          resources: [events]
+          verbs: [create, patch]
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      seccompProfile: {type: RuntimeDefault}
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
