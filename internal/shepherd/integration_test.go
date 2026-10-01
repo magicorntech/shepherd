@@ -22,8 +22,9 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
 
-	"github.com/magicorntech/shepherd/internal/policy"
-	"github.com/magicorntech/shepherd/internal/reaper"
+	"github.com/magicorntech/shepherd/internal/job/evictedpods"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods/policy"
 	"github.com/magicorntech/shepherd/internal/testenv"
 )
 
@@ -179,18 +180,19 @@ func start(t *testing.T, cfg *rest.Config, ns string, tweak ...func(*Options)) *
 	opts := Options{
 		Version:   "test",
 		Namespace: ns,
-		Reaper: reaper.Config{
+		StuckPods: stuckpods.Config{
 			Policy: policy.Config{
 				DefaultMode:       policy.ModeDeadNode,
 				DeadNodeBuffer:    time.Second,
 				HealthyNodeBuffer: 2 * time.Second,
 			},
-			// An hour: anything that happens sooner was driven by a watch
-			// event or a deadline timer, not by the safety-net poll.
-			Interval:           time.Hour,
 			MaxDeletesPerSweep: 50,
 		},
-		Metrics:       reaper.NewMetrics(reg),
+		EvictedPods: evictedpods.Config{TTL: 3 * time.Second, MaxDeletesPerSweep: 50},
+		// An hour: anything that happens sooner was driven by a watch
+		// event or a deadline timer, not by the safety-net poll.
+		Interval:      time.Hour,
+		Registry:      reg,
 		LeaseName:     "shepherd-test",
 		LeaseDuration: 4 * time.Second,
 		RenewDeadline: 3 * time.Second,
@@ -275,7 +277,7 @@ func TestPodWithFinalizerIsNeverForceDeleted(t *testing.T) {
 func TestNodeGoingNotReadyTriggersALiveSweep(t *testing.T) {
 	c := testenv.Client(t)
 	ns, node := newNamespace(t, c), newNode(t, c, true)
-	start(t, testenv.Config(t), ns, func(o *Options) { o.Reaper.Policy.HealthyNodeBuffer = time.Hour })
+	start(t, testenv.Config(t), ns, func(o *Options) { o.StuckPods.Policy.HealthyNodeBuffer = time.Hour })
 
 	p := podOn(t, c, ns, node)
 	terminate(t, c, p)
@@ -415,11 +417,170 @@ func TestWorksUnderExactlyTheShippedRBAC(t *testing.T) {
 	p := podOn(t, admin, ns, node)
 	terminate(t, admin, p)
 
+	evicted := evictedPod(t, admin, ns, node, time.Hour)
+
 	waitGone(t, admin, p, 30*time.Second)
+	waitGone(t, admin, evicted, 15*time.Second) // the second job works under the same rules
 	waitFor(t, 5*time.Second, "an Event written under the restricted identity", func() bool {
 		return hasEvent(admin, ns, p.Name, "ShepherdForceDeleted")
 	})
 	if _, err := restricted.CoordinationV1().Leases(ns).Get(ctx, "shepherd-test", metav1.GetOptions{}); err != nil {
 		t.Errorf("the Lease was not created under the shipped RBAC: %v\nlogs:\n%s", err, inst.logs.String())
+	}
+}
+
+// ---------- evicted-pods job & job selection ----------
+
+// evictedPod creates a pod and marks it the way a kubelet does after a
+// node-pressure eviction: phase Failed, reason Evicted, with the status
+// settling `ago` in the past.
+func evictedPod(t *testing.T, c kubernetes.Interface, ns, node string, ago time.Duration, mutate ...func(*corev1.Pod)) *corev1.Pod {
+	t.Helper()
+	p := podOn(t, c, ns, node, mutate...)
+	p.Status = corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",
+		Message: "The node was low on resource: memory.",
+		Conditions: []corev1.PodCondition{{
+			Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-ago)),
+		}},
+	}
+	out, err := c.CoreV1().Pods(ns).UpdateStatus(context.Background(), p, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestEvictedPodOlderThanTheTTLIsDeleted(t *testing.T) {
+	c := testenv.Client(t)
+	ns, node := newNamespace(t, c), newNode(t, c, true)
+	start(t, testenv.Config(t), ns)
+
+	p := evictedPod(t, c, ns, node, time.Hour) // TTL in these tests is 3s
+	waitGone(t, c, p, 15*time.Second)
+}
+
+// The safety-net interval is an hour and the pod is brand new, so nothing
+// but the job's own deadline timer can delete it, and it must not be early.
+func TestYoungEvictedPodIsDeletedWhenItsTTLRunsOutNotBefore(t *testing.T) {
+	c := testenv.Client(t)
+	ns, node := newNamespace(t, c), newNode(t, c, true)
+	start(t, testenv.Config(t), ns)
+
+	p := evictedPod(t, c, ns, node, 0)
+	evictedAt := time.Now()
+
+	time.Sleep(time.Second)
+	if !exists(c, ns, p.Name) {
+		t.Fatal("evicted pod deleted long before its TTL")
+	}
+	waitGone(t, c, p, 15*time.Second)
+	// metav1.Time has second precision, so allow up to a second of slack.
+	if elapsed := time.Since(evictedAt); elapsed < 1500*time.Millisecond {
+		t.Fatalf("deleted after only %s with a 3s TTL", elapsed)
+	}
+}
+
+func TestOnlyEvictedPodsAreCleanedUp(t *testing.T) {
+	c := testenv.Client(t)
+	ns, node := newNamespace(t, c), newNode(t, c, true)
+	start(t, testenv.Config(t), ns)
+
+	otherFailure := evictedPod(t, c, ns, node, time.Hour)
+	otherFailure.Status.Reason = "NodeAffinity" // Failed, but not evicted
+	if _, err := c.CoreV1().Pods(ns).UpdateStatus(context.Background(), otherFailure, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	kept := evictedPod(t, c, ns, node, time.Hour, func(p *corev1.Pod) {
+		p.Labels = map[string]string{"shepherd.magicorn.co/evicted-cleanup": "off"}
+	})
+	running := podOn(t, c, ns, node)
+	control := evictedPod(t, c, ns, node, time.Hour)
+
+	// The control proves a sweep really did happen with the others present.
+	waitGone(t, c, control, 15*time.Second)
+	for _, p := range []*corev1.Pod{otherFailure, kept, running} {
+		if !exists(c, ns, p.Name) {
+			t.Errorf("pod %s should have been left alone", p.Name)
+		}
+	}
+}
+
+func TestExcludedJobsDoNothingAndTheRestKeepWorking(t *testing.T) {
+	c := testenv.Client(t)
+
+	t.Run("excluding evicted-pods leaves evicted pods but stuck-pods still acts", func(t *testing.T) {
+		ns, dead := newNamespace(t, c), newNode(t, c, false)
+		start(t, testenv.Config(t), ns, func(o *Options) { o.ExcludeJobs = []string{evictedpods.JobName} })
+
+		evicted := evictedPod(t, c, ns, dead, time.Hour)
+		stuck := podOn(t, c, ns, dead)
+		terminate(t, c, stuck)
+
+		waitGone(t, c, stuck, 20*time.Second) // stuck-pods ran...
+		time.Sleep(5 * time.Second)           // ...well past the 3s TTL
+		if !exists(c, ns, evicted.Name) {
+			t.Fatal("evicted-pods is excluded but still deleted an evicted pod")
+		}
+	})
+
+	t.Run("excluding stuck-pods leaves stuck pods but evicted-pods still acts", func(t *testing.T) {
+		ns, dead := newNamespace(t, c), newNode(t, c, false)
+		start(t, testenv.Config(t), ns, func(o *Options) { o.ExcludeJobs = []string{stuckpods.JobName} })
+
+		stuck := podOn(t, c, ns, dead)
+		terminate(t, c, stuck)
+		evicted := evictedPod(t, c, ns, dead, time.Hour)
+
+		waitGone(t, c, evicted, 20*time.Second) // evicted-pods ran...
+		time.Sleep(4 * time.Second)             // ...well past the stuck-pods deadline
+		if !exists(c, ns, stuck.Name) {
+			t.Fatal("stuck-pods is excluded but still force-deleted a pod")
+		}
+	})
+}
+
+func TestJobNamesAreValidated(t *testing.T) {
+	if err := ValidateJobNames([]string{"stuck-pods", "evicted-pods"}); err != nil {
+		t.Fatalf("known jobs rejected: %v", err)
+	}
+	err := ValidateJobNames([]string{"evicted-pods", "evicted-podz"})
+	if err == nil || !strings.Contains(err.Error(), `"evicted-podz"`) || !strings.Contains(err.Error(), "stuck-pods") {
+		t.Fatalf("a typo must be rejected, naming it and listing the real jobs; got: %v", err)
+	}
+	// The same validation guards Run, so a typo can't silently exclude nothing.
+	if err := Run(context.Background(), nil, Options{ExcludeJobs: []string{"nope"}}, slog.Default()); err == nil {
+		t.Fatal("Run accepted an unknown job name")
+	}
+}
+
+func TestExcludingEveryJobIsAnError(t *testing.T) {
+	c := testenv.Client(t)
+	err := Run(context.Background(), c, Options{ExcludeJobs: AllJobs, Registry: prometheus.NewRegistry()}, slog.Default())
+	if err == nil || !strings.Contains(err.Error(), "nothing to do") {
+		t.Fatalf("got %v, want an error saying there is nothing to do", err)
+	}
+}
+
+func TestDryRunAppliesToEveryJob(t *testing.T) {
+	c := testenv.Client(t)
+	ns, dead := newNamespace(t, c), newNode(t, c, false)
+	inst := start(t, testenv.Config(t), ns, func(o *Options) { o.DryRun = true })
+
+	stuck := podOn(t, c, ns, dead)
+	terminate(t, c, stuck)
+	evicted := evictedPod(t, c, ns, dead, time.Hour)
+
+	// Both jobs announce what they would do...
+	waitFor(t, 20*time.Second, "both jobs to report in dry-run", func() bool {
+		l := inst.logs.String()
+		return strings.Contains(l, `"msg":"would force-delete pod"`) && strings.Contains(l, `"msg":"would delete evicted pod"`)
+	})
+	// ...and neither does it.
+	time.Sleep(2 * time.Second)
+	if !exists(c, ns, stuck.Name) || !exists(c, ns, evicted.Name) {
+		t.Fatal("--dry-run deleted something")
 	}
 }

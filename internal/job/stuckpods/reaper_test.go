@@ -1,4 +1,4 @@
-package reaper
+package stuckpods
 
 import (
 	"bytes"
@@ -20,7 +20,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
-	"github.com/magicorntech/shepherd/internal/policy"
+	"github.com/magicorntech/shepherd/internal/job"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods/policy"
 )
 
 var now = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
@@ -197,13 +198,13 @@ func TestSweepReturnsTimeUntilEarliestDeadline(t *testing.T) {
 	}
 }
 
-func TestRunSweepsAtStartupWithoutWaitingForInterval(t *testing.T) {
-	h := newHarness(t, Config{Interval: time.Hour}, []*corev1.Node{mkNode("dead", false)},
+func TestRunnerSweepsAtStartupWithoutWaitingForInterval(t *testing.T) {
+	h := newHarness(t, Config{}, []*corev1.Node{mkNode("dead", false)},
 		[]*corev1.Pod{stuckPod("a", "dead", 10*time.Minute)})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	go func() { h.r.Run(ctx); close(done) }()
+	go func() { job.NewRunner(h.r, time.Hour).Run(ctx); close(done) }()
 
 	// Interval is 1h, so a delete within 2s proves Run sweeps immediately
 	deadline := time.Now().Add(2 * time.Second)

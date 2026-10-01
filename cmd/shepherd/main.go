@@ -6,12 +6,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,8 +24,9 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/magicorntech/shepherd/internal/policy"
-	"github.com/magicorntech/shepherd/internal/reaper"
+	"github.com/magicorntech/shepherd/internal/job/evictedpods"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods/policy"
 	"github.com/magicorntech/shepherd/internal/shepherd"
 )
 
@@ -33,7 +37,7 @@ func main() {
 		kubeconfig   = flag.String("kubeconfig", "", "path to kubeconfig; empty = in-cluster")
 		namespace    = flag.String("namespace", "", "only watch this namespace; empty = all")
 		interval     = flag.Duration("interval", 60*time.Second, "safety-net sweep interval; sweeps are normally triggered by watch events and per-pod deadlines")
-		dryRun       = flag.Bool("dry-run", false, "log what would be force-deleted without deleting")
+		dryRun       = flag.Bool("dry-run", false, "log what would be deleted without deleting (all jobs)")
 		defaultMode  = flag.String("default-mode", "dead-node", "mode for pods without the "+policy.ModeLabel+" label: off, dead-node, any")
 		deadBuffer   = flag.Duration("dead-node-buffer", 30*time.Second, "extra wait after the pod's deletion deadline before force-deleting a pod on a dead node")
 		healthyBuf   = flag.Duration("healthy-node-buffer", 5*time.Minute, "extra wait after the pod's deletion deadline before force-deleting a pod on a Ready node (mode=any only)")
@@ -47,6 +51,9 @@ func main() {
 		leaseNS      = flag.String("leader-election-namespace", "", "namespace of the Lease; empty = the pod's own namespace")
 		leaseName    = flag.String("leader-election-name", "shepherd", "name of the Lease")
 		logJSON      = flag.Bool("log-json", true, "JSON logs")
+		excludeJobs  = flag.String("exclude-jobs", "", "comma-separated jobs to turn off ("+strings.Join(shepherd.AllJobs, ", ")+"); all jobs run by default")
+		evictedTTL   = flag.Int("evicted-ttl-minutes", 1440, "evicted-pods job: delete pods the kubelet evicted once they are this many minutes old")
+		evictedMax   = flag.Int("evicted-max-deletes-per-sweep", 200, "evicted-pods job: cap on deletes in a single sweep")
 		logLevel     = flag.String("log-level", "info", "debug, info, warn or error; debug also logs every pod that is waiting for its deadline")
 	)
 	flag.Parse()
@@ -66,6 +73,17 @@ func main() {
 	mode, err := policy.ParseMode(*defaultMode)
 	if err != nil {
 		fatal(log, "bad --default-mode", err)
+	}
+
+	excluded := splitList(*excludeJobs)
+	if err := shepherd.ValidateJobNames(excluded); err != nil {
+		fatal(log, "bad --exclude-jobs", err)
+	}
+	if len(excluded) > 0 && len(slices.DeleteFunc(slices.Clone(shepherd.AllJobs), func(n string) bool { return slices.Contains(excluded, n) })) == 0 {
+		fatal(log, "bad --exclude-jobs", errors.New("every job is excluded; nothing to do"))
+	}
+	if *evictedTTL < 1 && !slices.Contains(excluded, evictedpods.JobName) {
+		fatal(log, "bad --evicted-ttl-minutes", fmt.Errorf("%d: must be at least 1; to turn the job off use --exclude-jobs=%s", *evictedTTL, evictedpods.JobName))
 	}
 
 	cfg, err := restConfig(*kubeconfig)
@@ -110,9 +128,12 @@ func main() {
 	id, _ := os.Hostname()
 
 	err = shepherd.Run(ctx, client, shepherd.Options{
-		Version:   version,
-		Namespace: *namespace,
-		Reaper: reaper.Config{
+		Version:     version,
+		Namespace:   *namespace,
+		ExcludeJobs: excluded,
+		DryRun:      *dryRun,
+		Interval:    *interval,
+		StuckPods: stuckpods.Config{
 			Policy: policy.Config{
 				DefaultMode:        mode,
 				DeadNodeBuffer:     *deadBuffer,
@@ -120,13 +141,15 @@ func main() {
 				IncludeStatefulSet: *inclSTS,
 				IncludePVC:         *inclPVC,
 			},
-			Interval:           *interval,
-			DryRun:             *dryRun,
 			MaxDeletesPerSweep: *maxPerSweep,
 			BreakerFraction:    *breakerFrac,
 			BreakerMinNodes:    *breakerNodes,
 		},
-		Metrics:        reaper.NewMetrics(reg),
+		EvictedPods: evictedpods.Config{
+			TTL:                time.Duration(*evictedTTL) * time.Minute,
+			MaxDeletesPerSweep: *evictedMax,
+		},
+		Registry:       reg,
 		LeaderElect:    *leaderElect,
 		LeaseName:      *leaseName,
 		LeaseNamespace: ns,
@@ -136,6 +159,17 @@ func main() {
 	if err != nil {
 		fatal(log, "run", err)
 	}
+}
+
+// splitList parses a comma-separated flag, ignoring blanks and spaces.
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func restConfig(kubeconfig string) (*rest.Config, error) {

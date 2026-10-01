@@ -1,7 +1,10 @@
-// Package shepherd wires the pieces together: informers, the reaper, the
-// live event triggers, and leader election. It lives outside cmd/ so the
-// whole thing can be run against a real API server in tests, exactly the way
-// main runs it.
+// Package shepherd wires the pieces together: the shared informers, the
+// enabled jobs and their live event triggers, and leader election. It lives
+// outside cmd/ so the whole thing can be run against a real API server in
+// tests, exactly the way main runs it.
+//
+// To add a job: implement job.Job in its own package under internal/job, add
+// its Config to Options and one case to buildJob below.
 package shepherd
 
 import (
@@ -9,11 +12,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
+	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -22,16 +30,42 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
 
-	"github.com/magicorntech/shepherd/internal/reaper"
+	"github.com/magicorntech/shepherd/internal/job"
+	"github.com/magicorntech/shepherd/internal/job/evictedpods"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods"
 )
+
+// AllJobs lists every job, in the order they are started. All are enabled
+// unless excluded.
+var AllJobs = []string{stuckpods.JobName, evictedpods.JobName}
+
+// ValidateJobNames rejects names that are not a known job, so a typo in
+// --exclude-jobs fails at startup instead of silently excluding nothing.
+func ValidateJobNames(names []string) error {
+	for _, n := range names {
+		if !slices.Contains(AllJobs, n) {
+			return fmt.Errorf("unknown job %q (known: %s)", n, strings.Join(AllJobs, ", "))
+		}
+	}
+	return nil
+}
 
 type Options struct {
 	Version string
 	// Namespace restricts the pod informer; "" = all namespaces. Nodes are
 	// cluster-scoped and always watched in full.
 	Namespace string
-	Reaper    reaper.Config
-	Metrics   *reaper.Metrics
+
+	// ExcludeJobs names jobs to leave out. Everything else runs.
+	ExcludeJobs []string
+	StuckPods   stuckpods.Config
+	EvictedPods evictedpods.Config
+	// DryRun applies to every job (it overrides their own DryRun field).
+	DryRun bool
+	// Interval is every job's safety-net sweep interval.
+	Interval time.Duration
+	// Registry receives the metrics of the enabled jobs.
+	Registry prometheus.Registerer
 
 	LeaderElect    bool
 	LeaseName      string
@@ -51,9 +85,14 @@ type Options struct {
 
 // Run blocks until ctx is cancelled (or startup fails).
 func Run(ctx context.Context, client kubernetes.Interface, opts Options, log *slog.Logger) error {
-	// Pod informers only need to see pods being deleted, but the API can't
-	// field-select on deletionTimestamp, so cache them all and filter in
-	// the sweep.
+	if err := ValidateJobNames(opts.ExcludeJobs); err != nil {
+		return err
+	}
+	opts.StuckPods.DryRun, opts.EvictedPods.DryRun = opts.DryRun, opts.DryRun
+
+	// Pod informers only need to see a few pods, but the API can't
+	// field-select on deletionTimestamp or phase reason, so cache them all
+	// and filter in each job.
 	podFactory := informers.NewSharedInformerFactoryWithOptions(client, 0, informers.WithNamespace(opts.Namespace))
 	podInformer := podFactory.Core().V1().Pods()
 	nodeFactory := informers.NewSharedInformerFactory(client, 0)
@@ -64,21 +103,40 @@ func Run(ctx context.Context, client kubernetes.Interface, opts Options, log *sl
 	defer broadcaster.Shutdown()
 	recorder := broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "shepherd"})
 
-	r := reaper.New(opts.Reaper, client, podInformer.Lister(), nodeInformer.Lister(), recorder, log, opts.Metrics)
+	var runners []*job.Runner
+	var enabled []string
+	for _, name := range AllJobs {
+		if slices.Contains(opts.ExcludeJobs, name) {
+			continue
+		}
+		j := buildJob(name, opts, client, podInformer, nodeInformer, recorder, log.With("job", name))
+		runners = append(runners, job.NewRunner(j, opts.Interval))
+		enabled = append(enabled, name)
+	}
+	if len(runners) == 0 {
+		return errors.New("every job is excluded; nothing to do")
+	}
 
-	// Live triggers. A pod entering Terminating, or a node flipping its Ready
-	// state / disappearing, can change a decision immediately; the reaper
-	// also sleeps exactly until the next pod's deadline, so nothing waits on
-	// a poll tick.
+	// Live triggers: each job says which events should wake it.
 	if _, err := podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(o any) {
-			if p, ok := o.(*corev1.Pod); ok && p.DeletionTimestamp != nil {
-				r.Kick()
+			if p, ok := o.(*corev1.Pod); ok {
+				for _, r := range runners {
+					if t := r.Job.Triggers().Pod; t != nil && t(nil, p) {
+						r.Kick()
+					}
+				}
 			}
 		},
-		UpdateFunc: func(_, o any) {
-			if p, ok := o.(*corev1.Pod); ok && p.DeletionTimestamp != nil {
-				r.Kick()
+		UpdateFunc: func(o, n any) {
+			old, ok1 := o.(*corev1.Pod)
+			cur, ok2 := n.(*corev1.Pod)
+			if ok1 && ok2 {
+				for _, r := range runners {
+					if t := r.Job.Triggers().Pod; t != nil && t(old, cur) {
+						r.Kick()
+					}
+				}
 			}
 		},
 	}); err != nil {
@@ -86,13 +144,23 @@ func Run(ctx context.Context, client kubernetes.Interface, opts Options, log *sl
 	}
 	if _, err := nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(o, n any) {
-			on, ok1 := o.(*corev1.Node)
-			nn, ok2 := n.(*corev1.Node)
-			if ok1 && ok2 && nodeReady(on) != nodeReady(nn) {
-				r.Kick()
+			old, ok1 := o.(*corev1.Node)
+			cur, ok2 := n.(*corev1.Node)
+			if ok1 && ok2 {
+				for _, r := range runners {
+					if t := r.Job.Triggers().Node; t != nil && t(old, cur) {
+						r.Kick()
+					}
+				}
 			}
 		},
-		DeleteFunc: func(any) { r.Kick() },
+		DeleteFunc: func(any) {
+			for _, r := range runners {
+				if r.Job.Triggers().NodeDeleted {
+					r.Kick()
+				}
+			}
+		},
 	}); err != nil {
 		return fmt.Errorf("node handler: %w", err)
 	}
@@ -108,14 +176,23 @@ func Run(ctx context.Context, client kubernetes.Interface, opts Options, log *sl
 		opts.OnSynced()
 	}
 
-	log.Info("shepherd started", "version", opts.Version, "dryRun", opts.Reaper.DryRun,
-		"defaultMode", string(opts.Reaper.Policy.DefaultMode), "namespace", opts.Namespace, "leaderElect", opts.LeaderElect)
-	if opts.Reaper.DryRun {
+	log.Info("shepherd started", "version", opts.Version, "jobs", enabled, "excludedJobs", opts.ExcludeJobs,
+		"dryRun", opts.DryRun, "namespace", opts.Namespace, "leaderElect", opts.LeaderElect)
+	if opts.DryRun {
 		log.Warn("DRY RUN: nothing will be deleted. Drop --dry-run to act.")
 	}
 
+	runAll := func(ctx context.Context) {
+		var wg sync.WaitGroup
+		for _, r := range runners {
+			wg.Add(1)
+			go func() { defer wg.Done(); r.Run(ctx) }()
+		}
+		wg.Wait()
+	}
+
 	if !opts.LeaderElect {
-		r.Run(ctx)
+		runAll(ctx)
 		return nil
 	}
 
@@ -131,7 +208,7 @@ func Run(ctx context.Context, client kubernetes.Interface, opts Options, log *sl
 		RetryPeriod:     orDefault(opts.RetryPeriod, 5*time.Second),
 		Name:            opts.LeaseName,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) { log.Info("became leader", "id", opts.Identity); r.Run(ctx) },
+			OnStartedLeading: func(ctx context.Context) { log.Info("became leader", "id", opts.Identity); runAll(ctx) },
 			OnStoppedLeading: func() { log.Info("stopped leading", "id", opts.Identity) },
 		},
 	})
@@ -142,18 +219,20 @@ func Run(ctx context.Context, client kubernetes.Interface, opts Options, log *sl
 	return nil
 }
 
+func buildJob(name string, opts Options, client kubernetes.Interface,
+	pods corev1informers.PodInformer, nodes corev1informers.NodeInformer, recorder record.EventRecorder, log *slog.Logger) job.Job {
+	switch name {
+	case stuckpods.JobName:
+		return stuckpods.New(opts.StuckPods, client, pods.Lister(), nodes.Lister(), recorder, log, stuckpods.NewMetrics(opts.Registry))
+	case evictedpods.JobName:
+		return evictedpods.New(opts.EvictedPods, client, pods.Lister(), log, evictedpods.NewMetrics(opts.Registry))
+	}
+	panic("shepherd: no constructor for job " + name) // AllJobs and this switch must agree
+}
+
 func orDefault(d, def time.Duration) time.Duration {
 	if d == 0 {
 		return def
 	}
 	return d
-}
-
-func nodeReady(n *corev1.Node) bool {
-	for _, c := range n.Status.Conditions {
-		if c.Type == corev1.NodeReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }

@@ -3,16 +3,24 @@
 [![CI](https://github.com/magicorntech/shepherd/actions/workflows/ci.yml/badge.svg)](https://github.com/magicorntech/shepherd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A small cluster janitor for Kubernetes. Its first job: **force-delete pods that
-are stuck `Terminating`**, so a `Recreate` rollout (or anything else waiting for
-the old pod object to disappear) isn't blocked forever.
+A small, modular cluster janitor for Kubernetes. Each chore is a separate
+**job**; all run by default and any can be switched off.
+
+| job | what it does |
+|-----|--------------|
+| [`stuck-pods`](#job-stuck-pods) | force-deletes pods stuck `Terminating`, so a `Recreate` rollout (or anything else waiting for the old pod object to disappear) isn't blocked forever |
+| [`evicted-pods`](#job-evicted-pods) | deletes pods the kubelet evicted once they are a configurable number of minutes old (default 1440 = 24h) |
+
+Turn a job off with `--exclude-jobs=evicted-pods` (comma-separated for several).
 
 - Event-driven (watches pods and nodes), no polling lag
 - Works cluster-wide out of the box; a pod label overrides it per workload (exempt, or widen)
 - Optional `--dry-run` to preview before acting
 - Single static binary, distroless image, leader-elected, Prometheus metrics
 
-## The problem
+## Job: stuck-pods
+
+### The problem
 
 When a node dies hard (kernel panic, board failure, lost power), its kubelet
 never confirms that the pods on it are gone. They sit in `Terminating`
@@ -24,7 +32,7 @@ human runs `kubectl delete pod --force`.
 which is exactly the component that is gone. The same stall can also happen on a
 healthy node when a container refuses to die.
 
-## How it works
+### How it works
 
 shepherd watches pods and nodes. A sweep runs immediately when a pod enters
 `Terminating` or a node changes Ready state, and otherwise sleeps *exactly* until
@@ -41,7 +49,7 @@ that Kubernetes itself only marks a silent node NotReady after
 `node-monitor-grace-period` (40s by default), so total time-to-recovery is
 roughly that + the pod's grace period + the buffer.
 
-### Per-workload override
+#### Per-workload override
 
 By default (`--default-mode=dead-node`) every pod in the cluster is covered. To
 change that for one workload, put this label on its **pod template**:
@@ -66,7 +74,7 @@ container, so for something holding an exclusive resource (a UDP port, a lock)
 the old and new pod can briefly overlap. `--default-mode=off` flips shepherd to
 true opt-in (only labelled pods are touched).
 
-### What it will not force-delete (alert only)
+#### What it will not force-delete (alert only)
 
 | pod | why | override |
 |-----|-----|----------|
@@ -75,7 +83,7 @@ true opt-in (only labelled pods are touched).
 | uses a **PVC / ephemeral volume** | RWO volumes stay attached to the dead node | `--include-pvc` |
 | mirror pod / unscheduled | not shepherd's business | none |
 
-### Safety rails
+#### Safety rails
 
 - **Optional dry-run.** `--dry-run=true` logs what it would delete and deletes nothing.
 - **Circuit breaker.** If more than 30% of nodes (in clusters of 5+) are
@@ -85,7 +93,7 @@ true opt-in (only labelled pods are touched).
 - **Leader election** (Lease), so two replicas never both act.
 - Every action produces a Kubernetes Event and a structured log line.
 
-### Know the limits
+#### Know the limits
 
 Force-deleting a pod removes the *API object*; it cannot stop a container on a
 node that is merely unreachable rather than dead. If a node is partitioned but
@@ -94,6 +102,36 @@ replacement, i.e. a **brief duplicate**. For workloads where that is unsafe
 (exclusive ports, single-writer data), pair shepherd with fencing
 (power-cycle the node via BMC/cloud API before it is declared dead), or use the
 `node.kubernetes.io/out-of-service` taint for non-graceful shutdown.
+
+## Job: evicted-pods
+
+When a node runs low on memory, disk or PIDs the kubelet **evicts** pods: they
+end up `Failed` with reason `Evicted`. The pod object is left behind on purpose,
+as evidence, and nothing removes it afterwards except the controller-manager's
+pod GC, which only starts once the cluster holds `terminated-pod-gc-threshold`
+(12500 by default) terminated pods. After a pressure incident that is thousands
+of dead pods in `kubectl get pods`, dashboards and every list call.
+
+This job deletes an evicted pod once it is older than `--evicted-ttl-minutes`
+(default **1440**, i.e. 24 hours: long enough to look at what happened).
+
+- Matches exactly `status.phase=Failed` with `status.reason=Evicted`. Other
+  `Failed` pods (`NodeAffinity`, `OutOfcpu`, `Error`, ...) and `Succeeded`/`Completed`
+  pods are never touched.
+- **Age** is measured from when the pod became `Failed` (its latest status
+  transition or container termination time), not from when it was created. If the
+  pod carries no such timestamps it falls back to `startTime`, then to
+  `creationTimestamp`.
+- Keep a specific pod for investigation by labelling it
+  `shepherd.magicorn.co/evicted-cleanup: "off"`.
+- Before deleting, the pod's eviction `message` (e.g. *The node was low on
+  resource: memory*) is written to the log, since the pod was the only record of it.
+- A normal delete with a UID precondition (the pod is already terminal, so no
+  force is needed, and a pod that reused the name is never touched). At most
+  `--evicted-max-deletes-per-sweep` (default 200) per sweep, oldest first, so a
+  storm of thousands of pods is worked off gently rather than in one burst.
+- It sleeps until the next pod's TTL runs out instead of polling, and `--dry-run`
+  applies to it as well.
 
 ## Install
 
@@ -107,7 +145,7 @@ support).
 ```bash
 helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
   --version 2.3.0 -n shepherd --create-namespace \
-  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.1/deploy/values.yaml
+  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.2.0/deploy/values.yaml
 ```
 
 The values grant everything shepherd needs through the chart's own
@@ -122,7 +160,7 @@ It acts immediately, cluster-wide. To preview first, install with
 ```bash
 helm upgrade --install shepherd oci://public.ecr.aws/magicorn/charts-deployment \
   --version 2.3.0 -n shepherd --create-namespace \
-  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.1.1/deploy/values.yaml \
+  -f https://raw.githubusercontent.com/magicorntech/shepherd/0.2.0/deploy/values.yaml \
   --set 'global.deployment.image.args={--dry-run=true,--default-mode=dead-node,--dead-node-buffer=30s,--healthy-node-buffer=5m}'
 
 kubectl -n shepherd logs deploy/shepherd -f | grep "would force-delete"
@@ -157,17 +195,20 @@ arm64). It needs a ServiceAccount with: `get,list,watch,delete` on `pods`,
 
 | flag | default | |
 |------|---------|--|
-| `--dry-run` | `false` | log what would be deleted, delete nothing |
-| `--default-mode` | `dead-node` | mode for pods without the label: `off`, `dead-node`, `any` |
-| `--dead-node-buffer` | `30s` | extra wait after a pod's deletion deadline, node dead |
-| `--healthy-node-buffer` | `5m` | extra wait after a pod's deletion deadline, node Ready |
-| `--include-statefulset` | `false` | also force-delete StatefulSet pods |
-| `--include-pvc` | `false` | also force-delete pods with PVC volumes |
-| `--max-deletes-per-sweep` | `50` | blast-radius cap |
-| `--breaker-not-ready-fraction` | `0.3` | breaker threshold; `0` disables |
-| `--breaker-min-nodes` | `5` | breaker only applies at this cluster size or larger |
+| `--exclude-jobs` | none | comma-separated jobs to turn off: `stuck-pods`, `evicted-pods`. All run by default; an unknown name is an error |
+| `--dry-run` | `false` | log what would be deleted, delete nothing (**all jobs**) |
+| `--evicted-ttl-minutes` | `1440` | evicted-pods: delete evicted pods once they are this many minutes old (must be at least 1; to turn the job off use `--exclude-jobs`) |
+| `--evicted-max-deletes-per-sweep` | `200` | evicted-pods: cap per sweep |
+| `--default-mode` | `dead-node` | stuck-pods: mode for pods without the label: `off`, `dead-node`, `any` |
+| `--dead-node-buffer` | `30s` | stuck-pods: extra wait after a pod's deletion deadline, node dead |
+| `--healthy-node-buffer` | `5m` | stuck-pods: extra wait after a pod's deletion deadline, node Ready |
+| `--include-statefulset` | `false` | stuck-pods: also force-delete StatefulSet pods |
+| `--include-pvc` | `false` | stuck-pods: also force-delete pods with PVC volumes |
+| `--max-deletes-per-sweep` | `50` | stuck-pods: blast-radius cap |
+| `--breaker-not-ready-fraction` | `0.3` | stuck-pods: breaker threshold; `0` disables |
+| `--breaker-min-nodes` | `5` | stuck-pods: breaker only applies at this cluster size or larger |
 | `--namespace` | all | restrict to one namespace |
-| `--interval` | `60s` | safety-net sweep interval |
+| `--interval` | `60s` | safety-net sweep interval (every job) |
 | `--leader-elect` | `true` | |
 | `--leader-election-namespace` | pod's own | |
 | `--leader-election-name` | `shepherd` | |
@@ -178,7 +219,8 @@ arm64). It needs a ServiceAccount with: `get,list,watch,delete` on `pods`,
 
 ## Logs
 
-Structured JSON on stderr (`--log-json=false` for plain text).
+Structured JSON on stderr (`--log-json=false` for plain text). Every line a job
+writes carries `"job":"stuck-pods"` or `"job":"evicted-pods"`.
 
 | level | message | when |
 |-------|---------|------|
@@ -191,7 +233,16 @@ Structured JSON on stderr (`--log-json=false` for plain text).
 | ERROR | `force delete failed`, `list pods`, `list nodes` | unexpected API errors |
 | DEBUG | `pod terminating, waiting for its deadline` | `--log-level=debug`; shows `remaining` |
 
-`reason` on a deletion is `dead-node`, `node-missing` or `stuck-on-healthy-node`.
+`reason` on a force-deletion is `dead-node`, `node-missing` or `stuck-on-healthy-node`.
+The lines above are the `stuck-pods` job's. The `evicted-pods` job writes:
+
+| level | message | when |
+|-------|---------|------|
+| INFO | `deleted evicted pod` (`would delete evicted pod` with `--dry-run`) | carries `pod`, `node`, `age` and `evictionMessage` (why the kubelet evicted it) |
+| INFO | `evicted pod already gone or replaced` | the UID precondition did its job |
+| ERROR | `delete evicted pod failed` | unexpected API error |
+| DEBUG | `evicted pod waiting for its TTL` | `--log-level=debug`; shows `age` and `remaining` |
+
 The same facts are also Kubernetes Events on the pod (`ShepherdForceDeleted`,
 `ShepherdStuckTerminating`).
 
@@ -204,6 +255,9 @@ The same facts are also Kubernetes Events on the pod (`ShepherdForceDeleted`,
 | `shepherd_circuit_breaker_open` | 1 while dead-node deletes are suspended |
 | `shepherd_delete_errors_total` | unexpected API errors on delete |
 | `shepherd_sweep_duration_seconds` | |
+| `shepherd_evicted_pods_deleted_total{dry_run}` | evicted-pods: pods deleted (or that would have been) |
+| `shepherd_evicted_pods{state}` | evicted-pods: pods seen in the last sweep: `waiting` (younger than the TTL), `due`, `opted_out` |
+| `shepherd_evicted_delete_errors_total` | evicted-pods: unexpected API errors on delete |
 
 Suggested alerts:
 
@@ -228,8 +282,18 @@ make image    # local docker build
 ```
 
 The decision logic is a pure function in `internal/policy` (table-tested);
-`internal/reaper` is the event/timer loop and the cross-pod safety rails;
+`internal/job/stuckpods` is that job's sweep and cross-pod safety rails;
+`internal/job/evictedpods` is the second job; `internal/job` holds the `Job`
+interface and the `Runner` (event/deadline loop) they share;
 `internal/shepherd` wires informers, live triggers and leader election together.
+
+#### Adding a job
+
+Implement `job.Job` (`Name`, `Triggers`, `Sweep`) in a new package under
+`internal/job/`, add its config to `shepherd.Options` and one `case` to
+`buildJob` (and its name to `AllJobs`). It then gets the shared informers, live
+event triggers, deadline timers, leader election, `--dry-run`, `--exclude-jobs`
+and a `job` log attribute for free.
 
 ### Integration tests
 

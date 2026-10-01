@@ -1,10 +1,40 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0]
 
-- Integration tests against a real kube-apiserver (envtest); no behaviour change.
-- Internal: startup wiring moved from `cmd/shepherd` into `internal/shepherd`
-  so it can be run by tests.
+Second job (`evicted-pods`) and a modular job framework.
+
+### Added
+
+- **`evicted-pods` job**: deletes pods the kubelet evicted (`Failed` / reason
+  `Evicted`, nothing else) once they are older than `--evicted-ttl-minutes`
+  (default 1440 = 24h). Age counts from when the pod became Failed. Opt a pod
+  out with the label `shepherd.magicorn.co/evicted-cleanup: "off"`. Deletes are
+  UID-preconditioned and capped per sweep (`--evicted-max-deletes-per-sweep`,
+  default 200, oldest first); the eviction message is logged before the pod goes.
+  New metrics `shepherd_evicted_pods_deleted_total`, `shepherd_evicted_pods`,
+  `shepherd_evicted_delete_errors_total`.
+- **Modular jobs**: `--exclude-jobs=<name>[,<name>]` turns jobs off (all run by
+  default; unknown names are an error). `--dry-run` applies to every job. Log
+  lines now carry a `job` attribute.
+
+### Changed
+
+- **Behaviour change on upgrade:** the new job is on by default, so an upgraded
+  install starts deleting evicted pods older than 24h cluster-wide. Add
+  `--exclude-jobs=evicted-pods` to keep the old behaviour. No RBAC change: the
+  `pods` delete permission is already granted.
+
+### Internal
+
+- Jobs live under `internal/job/<name>`, sharing a `Job` interface and a
+  `Runner`; `internal/policy` and `internal/reaper` moved to
+  `internal/job/stuckpods/policy` and `internal/job/stuckpods`.
+- Startup wiring moved from `cmd/shepherd` into `internal/shepherd` so it can be
+  run by tests.
+- Integration tests against a real kube-apiserver (envtest): live triggers,
+  leader election, UID preconditions, and the exact RBAC shipped in
+  `deploy/values.yaml`. No behaviour change from these.
 
 ## [0.1.1]
 

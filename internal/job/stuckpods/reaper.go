@@ -1,8 +1,8 @@
-// Package reaper is the stuck-Terminating-pod reaper: it looks at every
+// Package stuckpods is the stuck-Terminating-pod reaper: it looks at every
 // terminating pod each sweep, asks internal/policy what to do, and applies
 // the safety rails that only make sense across many pods (per-sweep delete
 // cap, circuit breaker, dry-run).
-package reaper
+package stuckpods
 
 import (
 	"context"
@@ -19,12 +19,12 @@ import (
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
 
-	"github.com/magicorntech/shepherd/internal/policy"
+	"github.com/magicorntech/shepherd/internal/job"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods/policy"
 )
 
 type Config struct {
-	Policy   policy.Config
-	Interval time.Duration
+	Policy policy.Config
 	// DryRun logs and counts what would be deleted but never calls Delete.
 	DryRun bool
 	// MaxDeletesPerSweep bounds the blast radius of one bad sweep. Pods over
@@ -49,7 +49,6 @@ type Reaper struct {
 	log      *slog.Logger
 	now      func() time.Time
 	m        *Metrics
-	kick     chan struct{}
 
 	// alerted remembers what we already told humans about each stuck pod, so
 	// a pod that stays stuck is reported once (and again after alertRepeat
@@ -70,56 +69,33 @@ const alertRepeat = time.Hour
 
 func New(cfg Config, client kubernetes.Interface, pods listersv1.PodLister, nodes listersv1.NodeLister,
 	recorder record.EventRecorder, log *slog.Logger, m *Metrics) *Reaper {
-	return &Reaper{cfg: cfg, client: client, pods: pods, nodes: nodes, recorder: recorder, log: log, now: time.Now, m: m, kick: make(chan struct{}, 1),
+	return &Reaper{cfg: cfg, client: client, pods: pods, nodes: nodes, recorder: recorder, log: log, now: time.Now, m: m,
 		alerted: map[types.UID]alertState{}}
 }
 
-// minSweepGap bounds how often event bursts (35 pods of one Deployment all
-// flipping to Terminating at once) can trigger sweeps.
-const minSweepGap = 500 * time.Millisecond
+// Name implements job.Job.
+func (r *Reaper) Name() string { return JobName }
 
-// Kick requests a sweep as soon as possible. Safe to call from informer
-// event handlers: it never blocks, and kicks arriving while one is already
-// pending coalesce into it.
-func (r *Reaper) Kick() {
-	select {
-	case r.kick <- struct{}{}:
-	default:
+// JobName is the identifier used for --exclude-jobs and in logs.
+const JobName = "stuck-pods"
+
+// Triggers implements job.Job. A pod entering Terminating, or a node flipping
+// its Ready state / disappearing, can change a decision immediately; the
+// Runner also sleeps exactly until the next pod's deadline (Sweep's return
+// value), so nothing waits on a poll tick.
+func (r *Reaper) Triggers() job.Triggers {
+	return job.Triggers{
+		Pod:         func(_, cur *corev1.Pod) bool { return cur.DeletionTimestamp != nil },
+		Node:        func(old, cur *corev1.Node) bool { return isNotReady(old) != isNotReady(cur) },
+		NodeDeleted: true,
 	}
 }
 
-// Run sweeps until ctx is cancelled. A sweep happens when (a) an event
-// handler calls Kick, (b) the earliest pending pod reaches its force-delete
-// deadline, or (c) cfg.Interval elapses, as a safety net against a missed
-// event.
-func (r *Reaper) Run(ctx context.Context) {
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		case <-r.kick:
-		}
-		wake := r.Sweep(ctx)
-		next := r.cfg.Interval
-		if wake > 0 && wake < next {
-			next = wake
-		}
-		timer.Reset(next)
+var _ job.Job = (*Reaper)(nil)
 
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(minSweepGap):
-		}
-	}
-}
-
-// Sweep does one pass over the informer caches.
-// It returns how long until the soonest pod it is waiting on becomes
-// eligible (0 if none), so Run can sleep until exactly then.
+// Sweep does one pass over the informer caches. It returns how long until the
+// soonest pod it is waiting on becomes eligible (0 if none), so the Runner can
+// sleep until exactly then.
 func (r *Reaper) Sweep(ctx context.Context) time.Duration {
 	start := r.now()
 	pods, err := r.pods.List(everything)

@@ -23,6 +23,8 @@ must    defaults 'kind: Deployment'
 must    defaults 'replicas: 2'
 mustnot defaults '--dry-run=true'            # acts by default
 must    defaults '--default-mode=dead-node'  # cluster-wide, dead nodes only
+must    defaults '--evicted-ttl-minutes=1440' # second job, 24h
+mustnot defaults '--exclude-jobs'            # every job on by default
 mustnot defaults '--default-mode=any'        # never the default
 must    defaults 'kind: "ClusterRole"'
 must    defaults 'serviceAccountName: shepherd'

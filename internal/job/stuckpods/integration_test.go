@@ -1,4 +1,4 @@
-package reaper
+package stuckpods
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 
-	"github.com/magicorntech/shepherd/internal/policy"
+	"github.com/magicorntech/shepherd/internal/job/stuckpods/policy"
 	"github.com/magicorntech/shepherd/internal/testenv"
 )
 

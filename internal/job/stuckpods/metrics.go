@@ -1,4 +1,4 @@
-package reaper
+package stuckpods
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
